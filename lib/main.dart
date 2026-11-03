@@ -19,12 +19,14 @@ class Goal {
     required this.points,
     this.period = 0,
     this.times = 1,
+    this.perDay = 1,
   });
   final String id;
   String name;
   int points; // Punkte pro Abhaken
   int period;
   int times; // Zielanzahl pro Zeitraum (täglich: immer 1)
+  int perDay; // wie oft pro Tag abhakbar (1 = einmal)
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -32,6 +34,7 @@ class Goal {
         'points': points,
         'period': period,
         'times': times,
+        'perDay': perDay,
       };
   factory Goal.fromJson(Map<String, dynamic> j) => Goal(
         id: j['id'],
@@ -39,14 +42,18 @@ class Goal {
         points: j['points'],
         period: j['period'] ?? 0,
         times: j['times'] ?? 1,
+        perDay: j['perDay'] ?? 1,
       );
 
   String get periodWord => const ['Tag', 'Woche', 'Monat'][period];
 
   /// z. B. „+3 pro Mal · 2× pro Woche“ oder „+1 pro Tag“
-  String get description => period == 0
-      ? '+$points pro Tag'
-      : '+$points pro Mal · $times× pro $periodWord';
+  String get description {
+    final base = period == 0
+        ? (perDay > 1 ? '+$points pro Mal' : '+$points pro Tag')
+        : '+$points pro Mal · $times× pro $periodWord';
+    return perDay > 1 ? '$base · bis zu $perDay× am Tag' : base;
+  }
 }
 
 DateTime periodStart(int period, DateTime d) {
@@ -72,8 +79,18 @@ DateTime shiftPeriod(int period, DateTime start, int n) {
 }
 
 const _monate = [
-  'Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August',
-  'September', 'Oktober', 'November', 'Dezember'
+  'Januar',
+  'Februar',
+  'März',
+  'April',
+  'Mai',
+  'Juni',
+  'Juli',
+  'August',
+  'September',
+  'Oktober',
+  'November',
+  'Dezember'
 ];
 const _tage = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
 
@@ -84,7 +101,7 @@ int daysInMonth(DateTime m) => DateTime(m.year, m.month + 1, 0).day;
 
 class AppState extends ChangeNotifier {
   List<Goal> goals = [];
-  final Map<String, Set<String>> done = {}; // dateKey -> goalIds
+  final Map<String, Map<String, int>> done = {}; // dateKey -> goalId -> Anzahl
   int targetPercent = 70;
   bool reminderOn = false;
   int reminderHour = 20;
@@ -98,7 +115,13 @@ class AppState extends ChangeNotifier {
       final j = jsonDecode(raw) as Map<String, dynamic>;
       goals = (j['goals'] as List).map((e) => Goal.fromJson(e)).toList();
       (j['done'] as Map<String, dynamic>).forEach((k, v) {
-        done[k] = Set<String>.from(v as List);
+        if (v is List) {
+          // altes Format: Liste von Ziel-IDs -> je einmal erledigt
+          done[k] = {for (final id in v) id as String: 1};
+        } else {
+          done[k] = (v as Map<String, dynamic>)
+              .map((id, n) => MapEntry(id, n as int));
+        }
       });
       targetPercent = j['targetPercent'] ?? 70;
       reminderOn = j['reminderOn'] ?? false;
@@ -122,7 +145,7 @@ class AppState extends ChangeNotifier {
       'data',
       jsonEncode({
         'goals': goals.map((g) => g.toJson()).toList(),
-        'done': done.map((k, v) => MapEntry(k, v.toList())),
+        'done': done,
         'targetPercent': targetPercent,
         'reminderOn': reminderOn,
         'reminderHour': reminderHour,
@@ -139,8 +162,7 @@ class AppState extends ChangeNotifier {
 
   /// Plant die Erinnerungen neu (heute entfällt, wenn schon etwas eingetragen ist).
   Future<void> refreshReminders() {
-    final hasEntryToday =
-        (done[dateKey(DateTime.now())]?.isNotEmpty) ?? false;
+    final hasEntryToday = (done[dateKey(DateTime.now())]?.isNotEmpty) ?? false;
     return NotificationService.instance.sync(
       enabled: reminderOn,
       hour: reminderHour,
@@ -158,44 +180,78 @@ class AppState extends ChangeNotifier {
     _changed();
   }
 
-  bool isDone(DateTime d, String goalId) =>
-      done[dateKey(d)]?.contains(goalId) ?? false;
+  int countOn(DateTime d, String goalId) => done[dateKey(d)]?[goalId] ?? 0;
 
-  void toggle(DateTime d, String goalId) {
-    final s = done.putIfAbsent(dateKey(d), () => {});
-    if (!s.remove(goalId)) s.add(goalId);
+  bool isDone(DateTime d, String goalId) => countOn(d, goalId) > 0;
+
+  void _setCount(DateTime d, String goalId, int n) {
+    final key = dateKey(d);
+    if (n <= 0) {
+      final day = done[key];
+      day?.remove(goalId);
+      if (day != null && day.isEmpty) done.remove(key);
+    } else {
+      done.putIfAbsent(key, () => {})[goalId] = n;
+    }
     _changed();
   }
 
-  /// Anzahl Abhak-Tage eines Ziels im Zeitraum, der bei [start] beginnt.
+  /// Ziele, die nur einmal pro Tag gehen: an-/abhaken.
+  void toggle(DateTime d, String goalId) =>
+      _setCount(d, goalId, countOn(d, goalId) > 0 ? 0 : 1);
+
+  /// Mehrmals-pro-Tag-Ziele: +1 bis zum Tageslimit.
+  void increment(DateTime d, Goal g) {
+    final c = countOn(d, g.id);
+    if (c < g.perDay) _setCount(d, g.id, c + 1);
+  }
+
+  void decrement(DateTime d, Goal g) {
+    final c = countOn(d, g.id);
+    if (c > 0) _setCount(d, g.id, c - 1);
+  }
+
+  /// Anzahl Erledigungen eines Ziels im Zeitraum, der bei [start] beginnt.
   int countInPeriod(Goal g, DateTime start) {
     final end = shiftPeriod(g.period, start, 1);
     var n = 0;
-    for (var d = start; d.isBefore(end); d = DateTime(d.year, d.month, d.day + 1)) {
-      if (isDone(d, g.id)) n++;
+    for (var d = start;
+        d.isBefore(end);
+        d = DateTime(d.year, d.month, d.day + 1)) {
+      n += countOn(d, g.id);
     }
     return n;
   }
 
   /// Punkte eines Ziels an einem Tag. Bei Wochen-/Monatszielen zählen nur
-  /// die ersten [times] Mal im Zeitraum, weitere bringen keine Punkte.
+  /// die ersten [times] Erledigungen im Zeitraum, weitere bringen keine Punkte.
   int pointsForGoalOnDay(Goal g, DateTime d) {
-    if (!isDone(d, g.id)) return 0;
-    if (g.period == 0) return g.points;
+    final c = countOn(d, g.id);
+    if (c == 0) return 0;
+    if (g.period == 0) return (c < g.perDay ? c : g.perDay) * g.points;
     var before = 0;
     for (var x = periodStart(g.period, d);
         x.isBefore(dayOnly(d));
         x = DateTime(x.year, x.month, x.day + 1)) {
-      if (isDone(x, g.id)) before++;
+      before += countOn(x, g.id);
     }
-    return before < g.times ? g.points : 0;
+    final available = g.times - before;
+    if (available <= 0) return 0;
+    return (c < available ? c : available) * g.points;
   }
 
   int pointsForDay(DateTime d) =>
       goals.fold(0, (a, g) => a + pointsForGoalOnDay(g, d));
 
   /// Summe der Punkte aller Ziele (Obergrenze für einen einzelnen Tag).
-  int get maxSingleDay => goals.fold(0, (a, g) => a + g.points);
+  int get maxSingleDay => goals.fold(
+      0,
+      (a, g) =>
+          a +
+          g.points *
+              (g.period == 0
+                  ? g.perDay
+                  : (g.perDay < g.times ? g.perDay : g.times)));
 
   int maxForGoalInMonth(Goal g, DateTime m) {
     final days = daysInMonth(m);
@@ -205,7 +261,7 @@ class AppState extends ChangeNotifier {
       case 2:
         return g.points * g.times;
       default:
-        return g.points * days;
+        return g.points * g.perDay * days;
     }
   }
 
@@ -228,21 +284,24 @@ class AppState extends ChangeNotifier {
     return n;
   }
 
-  void addGoal(String name, int points, int period, int times) {
+  void addGoal(String name, int points, int period, int times, int perDay) {
     goals.add(Goal(
         id: DateTime.now().microsecondsSinceEpoch.toString(),
         name: name,
         points: points,
         period: period,
-        times: period == 0 ? 1 : times));
+        times: period == 0 ? 1 : times,
+        perDay: perDay));
     _changed();
   }
 
-  void editGoal(Goal g, String name, int points, int period, int times) {
+  void editGoal(
+      Goal g, String name, int points, int period, int times, int perDay) {
     g.name = name;
     g.points = points;
     g.period = period;
     g.times = period == 0 ? 1 : times;
+    g.perDay = perDay;
     _changed();
   }
 
@@ -277,8 +336,7 @@ class ZielApp extends StatelessWidget {
     return MaterialApp(
       title: 'Zielpunkte',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-          colorSchemeSeed: Colors.teal, useMaterial3: true),
+      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
       darkTheme: ThemeData(
           colorSchemeSeed: Colors.teal,
           brightness: Brightness.dark,
@@ -323,7 +381,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       listenable: appState,
       builder: (context, _) {
         if (!appState.loaded) {
-          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+          return const Scaffold(
+              body: Center(child: CircularProgressIndicator()));
         }
         // Bewusst NICHT const: Konstante Widgets werden von Flutter beim Rebuild
         // übersprungen, dann würden sich die Seiten nicht aktualisieren.
@@ -335,9 +394,12 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
             selectedIndex: _tab,
             onDestinationSelected: (i) => setState(() => _tab = i),
             destinations: const [
-              NavigationDestination(icon: Icon(Icons.check_circle_outline), label: 'Heute'),
-              NavigationDestination(icon: Icon(Icons.bar_chart), label: 'Monat'),
-              NavigationDestination(icon: Icon(Icons.flag_outlined), label: 'Ziele'),
+              NavigationDestination(
+                  icon: Icon(Icons.check_circle_outline), label: 'Heute'),
+              NavigationDestination(
+                  icon: Icon(Icons.bar_chart), label: 'Monat'),
+              NavigationDestination(
+                  icon: Icon(Icons.flag_outlined), label: 'Ziele'),
             ],
           ),
         );
@@ -404,10 +466,8 @@ class _TodayPageState extends State<TodayPage> {
           child: Column(
             children: [
               Text('${appState.pointsForDay(_day)}',
-                  style: Theme.of(context)
-                      .textTheme
-                      .displayMedium
-                      ?.copyWith(color: cs.primary, fontWeight: FontWeight.bold)),
+                  style: Theme.of(context).textTheme.displayMedium?.copyWith(
+                      color: cs.primary, fontWeight: FontWeight.bold)),
               Text('Punkte an diesem Tag',
                   style: Theme.of(context).textTheme.bodySmall),
             ],
@@ -415,7 +475,8 @@ class _TodayPageState extends State<TodayPage> {
         ),
         Expanded(
           child: appState.goals.isEmpty
-              ? const Center(child: Text('Lege zuerst unter „Ziele“ ein Ziel an.'))
+              ? const Center(
+                  child: Text('Lege zuerst unter „Ziele“ ein Ziel an.'))
               : ListView(
                   padding: const EdgeInsets.all(12),
                   children: [
@@ -428,43 +489,67 @@ class _TodayPageState extends State<TodayPage> {
   }
 
   Widget _goalTile(Goal g, ColorScheme cs) {
-    final checked = appState.isDone(_day, g.id);
+    final today = appState.countOn(_day, g.id);
+    final checked = today > 0;
+    final multi = g.perDay > 1;
     final streak = appState.streak(g);
-    final count = g.period == 0
+    final periodCount = g.period == 0
         ? 0
         : appState.countInPeriod(g, periodStart(g.period, _day));
-    final reached = g.period != 0 && count >= g.times;
+    final reached = g.period != 0 && periodCount >= g.times;
     final unit = const ['Tage', 'Wo.', 'Mon.'][g.period];
     final String sub;
     if (g.period == 0) {
-      sub = '+${g.points} ${g.points == 1 ? 'Punkt' : 'Punkte'}';
+      sub = multi
+          ? '$today/${g.perDay} heute · +${g.points} pro Mal'
+          : '+${g.points} ${g.points == 1 ? 'Punkt' : 'Punkte'}';
     } else {
       final when = g.period == 1 ? 'diese Woche' : 'diesen Monat';
-      final over = count > g.times ? ' ✨' : '';
-      sub = '$count/${g.times} $when$over · +${g.points} pro Mal'
+      final over = periodCount > g.times ? ' ✨' : '';
+      sub = '$periodCount/${g.times} $when$over · +${g.points} pro Mal'
+          '${multi ? ' · heute $today/${g.perDay}' : ''}'
           '${reached && !checked ? ' (weitere ohne Punkte)' : ''}';
     }
     return Card(
       color: checked ? cs.primaryContainer : null,
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: () => appState.toggle(_day, g.id),
+        onTap: () =>
+            multi ? appState.increment(_day, g) : appState.toggle(_day, g.id),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
           child: Row(
             children: [
-              Icon(checked ? Icons.check_circle : Icons.circle_outlined,
-                  size: 32, color: checked ? cs.primary : cs.outline),
+              if (multi)
+                CircleAvatar(
+                  radius: 16,
+                  backgroundColor:
+                      checked ? cs.primary : cs.outline.withOpacity(0.25),
+                  child: Text('$today',
+                      style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: checked ? cs.onPrimary : cs.onSurface)),
+                )
+              else
+                Icon(checked ? Icons.check_circle : Icons.circle_outlined,
+                    size: 32, color: checked ? cs.primary : cs.outline),
               const SizedBox(width: 16),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(g.name, style: Theme.of(context).textTheme.titleMedium),
+                    Text(g.name,
+                        style: Theme.of(context).textTheme.titleMedium),
                     Text(sub, style: Theme.of(context).textTheme.bodySmall),
                   ],
                 ),
               ),
+              if (multi && checked)
+                IconButton(
+                  tooltip: 'Eins zurück',
+                  icon: const Icon(Icons.remove_circle_outline),
+                  onPressed: () => appState.decrement(_day, g),
+                ),
               if (streak > 0)
                 Chip(
                   label: Text('🔥 $streak $unit'),
@@ -570,8 +655,12 @@ class _MonthPageState extends State<MonthPage> {
                   textBaseline: TextBaseline.alphabetic,
                   children: [
                     Text('$sum',
-                        style: Theme.of(context).textTheme.displaySmall?.copyWith(
-                            color: cs.primary, fontWeight: FontWeight.bold)),
+                        style: Theme.of(context)
+                            .textTheme
+                            .displaySmall
+                            ?.copyWith(
+                                color: cs.primary,
+                                fontWeight: FontWeight.bold)),
                     Text('  / $target Ziel  ·  max. $max',
                         style: Theme.of(context).textTheme.bodyMedium),
                   ],
@@ -633,7 +722,8 @@ class _MonthPageState extends State<MonthPage> {
 
   FlTitlesData _titles(int n, double yInterval) => FlTitlesData(
         topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+        rightTitles:
+            const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         leftTitles: AxisTitles(
           sideTitles: SideTitles(
             showTitles: true,
@@ -668,7 +758,9 @@ class _MonthPageState extends State<MonthPage> {
       );
 
   Widget _dailyChart(List<int> daily, int n, ColorScheme cs) {
-    final rawMax = [appState.maxSingleDay, ...daily, 1].reduce((a, b) => a > b ? a : b).toDouble();
+    final rawMax = [appState.maxSingleDay, ...daily, 1]
+        .reduce((a, b) => a > b ? a : b)
+        .toDouble();
     final interval = _niceInterval(rawMax);
     final maxY = _niceMax(rawMax, interval);
     return BarChart(
@@ -677,7 +769,8 @@ class _MonthPageState extends State<MonthPage> {
         minY: 0,
         titlesData: _titles(n, interval),
         borderData: FlBorderData(show: false),
-        gridData: FlGridData(drawVerticalLine: false, horizontalInterval: interval),
+        gridData:
+            FlGridData(drawVerticalLine: false, horizontalInterval: interval),
         barGroups: [
           for (var d = 1; d <= n; d++)
             BarChartGroupData(x: d, barRods: [
@@ -685,7 +778,8 @@ class _MonthPageState extends State<MonthPage> {
                 toY: daily[d - 1].toDouble(),
                 width: 5,
                 color: cs.primary,
-                borderRadius: const BorderRadius.vertical(top: Radius.circular(2)),
+                borderRadius:
+                    const BorderRadius.vertical(top: Radius.circular(2)),
               ),
             ]),
         ],
@@ -695,8 +789,7 @@ class _MonthPageState extends State<MonthPage> {
 
   Widget _cumulChart(
       List<FlSpot> cumul, int n, int target, int sum, ColorScheme cs) {
-    final rawTop =
-        [target, sum, 1].reduce((a, b) => a > b ? a : b).toDouble();
+    final rawTop = [target, sum, 1].reduce((a, b) => a > b ? a : b).toDouble();
     final interval = _niceInterval(rawTop);
     final top = _niceMax(rawTop, interval);
     return LineChart(
@@ -707,10 +800,14 @@ class _MonthPageState extends State<MonthPage> {
         maxY: top,
         titlesData: _titles(n, interval),
         borderData: FlBorderData(show: false),
-        gridData: FlGridData(drawVerticalLine: false, horizontalInterval: interval),
+        gridData:
+            FlGridData(drawVerticalLine: false, horizontalInterval: interval),
         lineBarsData: [
           LineChartBarData(
-            spots: [const FlSpot(0, 0), FlSpot(n.toDouble(), target.toDouble())],
+            spots: [
+              const FlSpot(0, 0),
+              FlSpot(n.toDouble(), target.toDouble())
+            ],
             isCurved: false,
             barWidth: 2,
             color: cs.outline,
@@ -806,8 +903,8 @@ class GoalsPage extends StatelessWidget {
   }
 
   Widget _reminderCard(BuildContext context) {
-    final time = TimeOfDay(
-        hour: appState.reminderHour, minute: appState.reminderMinute);
+    final time =
+        TimeOfDay(hour: appState.reminderHour, minute: appState.reminderMinute);
     return Card(
       child: Column(
         children: [
@@ -818,7 +915,8 @@ class GoalsPage extends StatelessWidget {
             value: appState.reminderOn,
             onChanged: (v) async {
               if (v) {
-                final ok = await NotificationService.instance.requestPermission();
+                final ok =
+                    await NotificationService.instance.requestPermission();
                 if (!ok) {
                   if (context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
@@ -854,9 +952,12 @@ class GoalsPage extends StatelessWidget {
       context: context,
       builder: (ctx) => AlertDialog(
         title: Text('„${g.name}“ löschen?'),
-        content: const Text('Die Punkte dieses Ziels fließen dann nicht mehr in die Auswertung ein.'),
+        content: const Text(
+            'Die Punkte dieses Ziels fließen dann nicht mehr in die Auswertung ein.'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Abbrechen')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Abbrechen')),
           FilledButton(
             onPressed: () {
               appState.deleteGoal(g);
@@ -874,6 +975,8 @@ class GoalsPage extends StatelessWidget {
     var pts = (goal?.points ?? 1).toDouble();
     var period = goal?.period ?? 0;
     var times = (goal?.times ?? 1).toDouble();
+    var multi = (goal?.perDay ?? 1) > 1;
+    var perDay = ((goal?.perDay ?? 1) < 2 ? 2 : goal!.perDay).toDouble();
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -881,68 +984,92 @@ class GoalsPage extends StatelessWidget {
           title: Text(goal == null ? 'Neues Ziel' : 'Ziel bearbeiten'),
           content: SingleChildScrollView(
             child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: ctrl,
-                autofocus: true,
-                decoration: const InputDecoration(
-                    labelText: 'Name', hintText: 'z. B. Kein Schoko'),
-              ),
-              const SizedBox(height: 16),
-              SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(value: 0, label: Text('Täglich')),
-                  ButtonSegment(value: 1, label: Text('Woche')),
-                  ButtonSegment(value: 2, label: Text('Monat')),
-                ],
-                selected: {period},
-                showSelectedIcon: false,
-                onSelectionChanged: (v) => setLocal(() {
-                  period = v.first;
-                  final maxT = period == 1 ? 6.0 : 28.0;
-                  if (times > maxT) times = maxT;
-                }),
-              ),
-              if (period != 0) ...[
-                const SizedBox(height: 12),
-                Text('Ziel: ${times.round()}× pro ${period == 1 ? 'Woche' : 'Monat'}'),
-                Slider(
-                  value: times,
-                  min: 1,
-                  max: period == 1 ? 6 : 28,
-                  divisions: period == 1 ? 5 : 27,
-                  label: '${times.round()}',
-                  onChanged: (v) => setLocal(() => times = v),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: ctrl,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                      labelText: 'Name', hintText: 'z. B. Kein Schoko'),
                 ),
-                Text('Punkte gibt es nur für die ersten ${times.round()} Mal.',
-                    style: Theme.of(context).textTheme.bodySmall),
+                const SizedBox(height: 16),
+                SegmentedButton<int>(
+                  segments: const [
+                    ButtonSegment(value: 0, label: Text('Täglich')),
+                    ButtonSegment(value: 1, label: Text('Woche')),
+                    ButtonSegment(value: 2, label: Text('Monat')),
+                  ],
+                  selected: {period},
+                  showSelectedIcon: false,
+                  onSelectionChanged: (v) => setLocal(() {
+                    period = v.first;
+                    final maxT = period == 1 ? 6.0 : 28.0;
+                    if (times > maxT) times = maxT;
+                  }),
+                ),
+                if (period != 0) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                      'Ziel: ${times.round()}× pro ${period == 1 ? 'Woche' : 'Monat'}'),
+                  Slider(
+                    value: times,
+                    min: 1,
+                    max: period == 1 ? 6 : 28,
+                    divisions: period == 1 ? 5 : 27,
+                    label: '${times.round()}',
+                    onChanged: (v) => setLocal(() => times = v),
+                  ),
+                  Text(
+                      'Punkte gibt es nur für die ersten ${times.round()} Mal.',
+                      style: Theme.of(context).textTheme.bodySmall),
+                ],
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Mehrmals am Tag möglich'),
+                  value: multi,
+                  onChanged: (v) => setLocal(() => multi = v),
+                ),
+                if (multi) ...[
+                  Text('Bis zu ${perDay.round()}× am Tag'),
+                  Slider(
+                    value: perDay,
+                    min: 2,
+                    max: 5,
+                    divisions: 3,
+                    label: '${perDay.round()}',
+                    onChanged: (v) => setLocal(() => perDay = v),
+                  ),
+                ],
+                const SizedBox(height: 4),
+                Text(period == 0 && !multi
+                    ? 'Punkte pro Tag: ${pts.round()}'
+                    : 'Punkte pro Mal: ${pts.round()}'),
+                Slider(
+                  value: pts,
+                  min: 1,
+                  max: 5,
+                  divisions: 4,
+                  label: '${pts.round()}',
+                  onChanged: (v) => setLocal(() => pts = v),
+                ),
               ],
-              const SizedBox(height: 12),
-              Text(period == 0
-                  ? 'Punkte pro Tag: ${pts.round()}'
-                  : 'Punkte pro Mal: ${pts.round()}'),
-              Slider(
-                value: pts,
-                min: 1,
-                max: 5,
-                divisions: 4,
-                label: '${pts.round()}',
-                onChanged: (v) => setLocal(() => pts = v),
-              ),
-            ],
-          ),
+            ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Abbrechen')),
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Abbrechen')),
             FilledButton(
               onPressed: () {
                 final name = ctrl.text.trim();
                 if (name.isEmpty) return;
                 if (goal == null) {
-                  appState.addGoal(name, pts.round(), period, times.round());
+                  appState.addGoal(name, pts.round(), period, times.round(),
+                      multi ? perDay.round() : 1);
                 } else {
-                  appState.editGoal(goal, name, pts.round(), period, times.round());
+                  appState.editGoal(goal, name, pts.round(), period,
+                      times.round(), multi ? perDay.round() : 1);
                 }
                 Navigator.pop(ctx);
               },
