@@ -1,11 +1,11 @@
 {
-    "name": "zielpunkte",
-    "short_name": "zielpunkte",
+    "name": "Zielpunkte",
+    "short_name": "Zielpunkte",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#00695C",
+    "theme_color": "#00695C",
+    "description": "Ziele mit Tagespunkten, Serien und Monatsauswertung.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
